@@ -32,8 +32,9 @@ public class Main extends JFrame {
         setLocationRelativeTo(null);
         setLayout(new BorderLayout(10, 10));
 
-        saveDefaultDevice("Light", new Light());
-        saveDefaultDevice("Fan", new Fan());
+        // Ensure the default devices exist in MySQL
+        saveDefaultDevice(new Light());
+        saveDefaultDevice(new Fan());
 
         addWindowListener(new java.awt.event.WindowAdapter() {
             @Override
@@ -41,6 +42,7 @@ public class Main extends JFrame {
                 if (monitor != null) {
                     monitor.stopMonitoring();
                 }
+
                 log("Smart Home Automation closed.");
                 dispose();
             }
@@ -84,7 +86,9 @@ public class Main extends JFrame {
 
         activityLog = new JTextArea(7, 40);
         activityLog.setEditable(false);
-        activityLog.setFont(new Font("Monospaced", Font.PLAIN, 12));
+        activityLog.setFont(
+                new Font("Monospaced", Font.PLAIN, 12)
+        );
 
         JScrollPane scrollPane = new JScrollPane(activityLog);
         scrollPane.setBorder(
@@ -99,6 +103,9 @@ public class Main extends JFrame {
         searchButton.addActionListener(e -> searchDevice());
         removeButton.addActionListener(e -> removeDevice());
 
+        // Load all saved devices and statuses from MySQL
+        loadAllDevicesFromDatabase();
+
         updateStatus();
         log("Smart Home Automation started.");
 
@@ -108,23 +115,60 @@ public class Main extends JFrame {
         log("Background device monitor started.");
     }
 
-    private void saveDefaultDevice(String name, Device device) {
-        try {
-            boolean saved = dao.addDevice(device);
+    // Save a default device if it does not already exist
+    private void saveDefaultDevice(Device device) {
+        boolean saved = dao.addDevice(device);
 
-            if (saved) {
-                log(name + " saved to MySQL.");
-            } else {
-                log(name + " already exists in MySQL.");
-            }
-        } catch (Exception ex) {
-            log("Database error saving " + name + ": "
-                    + ex.getMessage());
+        if (saved) {
+            log(device.getDeviceName() + " saved to MySQL.");
+        } else {
+            log(device.getDeviceName()
+                    + " was not inserted; it may already exist "
+                    + "or a database error occurred.");
         }
     }
 
+    // Load all saved devices and their statuses
+    private void loadAllDevicesFromDatabase() {
+        List<Device> savedDevices = dao.getAllDeviceObjects();
+
+        if (savedDevices.isEmpty()) {
+            log("No saved devices were loaded from MySQL.");
+            return;
+        }
+
+        synchronized (manager) {
+            for (Device savedDevice : savedDevices) {
+
+                Device existingDevice =
+                        manager.findDevice(savedDevice.getDeviceName());
+
+                if (existingDevice == null) {
+                    manager.addDevice(savedDevice);
+                    log("Loaded " + savedDevice.getDeviceName()
+                            + " from MySQL.");
+                } else {
+                    // Restore the status of an existing default device
+                    if (savedDevice.isOn()) {
+                        existingDevice.turnOn();
+                    } else {
+                        existingDevice.turnOff();
+                    }
+
+                    log("Restored " + existingDevice.getDeviceName()
+                            + " status: "
+                            + (existingDevice.isOn() ? "ON" : "OFF"));
+                }
+            }
+        }
+
+        log("Device loading from MySQL completed.");
+    }
+
+    // Toggle only after the database update succeeds
     private void toggleDevice(String name) {
         Device device;
+        String newStatus;
 
         synchronized (manager) {
             device = manager.findDevice(name);
@@ -134,26 +178,35 @@ public class Main extends JFrame {
                 return;
             }
 
-            if (device.isOn()) {
-                device.turnOff();
-            } else {
+            newStatus = device.isOn() ? "OFF" : "ON";
+        }
+
+        if (!dao.updateStatus(name, newStatus)) {
+            showError(
+                    "Could not update " + name + " in MySQL.\n"
+                    + "The device status has not been changed."
+            );
+
+            log("Database update failed for " + name
+                    + ". Previous status retained.");
+            return;
+        }
+
+        synchronized (manager) {
+            if ("ON".equals(newStatus)) {
                 device.turnOn();
+            } else {
+                device.turnOff();
             }
         }
 
-        String status = device.isOn() ? "ON" : "OFF";
-
-        if (dao.updateStatus(name, status)) {
-            log(name + " turned " + status
-                    + " and database updated.");
-        } else {
-            log(name + " changed to " + status
-                    + " in memory, but no database row was updated.");
-        }
+        log(name + " turned " + newStatus
+                + " and database updated successfully.");
 
         updateStatus();
     }
 
+    // Refresh the default device status labels
     private void updateStatus() {
         updateOneStatus("Light", lightStatus);
         updateOneStatus("Fan", fanStatus);
@@ -173,13 +226,15 @@ public class Main extends JFrame {
         }
     }
 
+    // Display all devices stored in MySQL
     private void viewDevices() {
         List<String> devices = dao.getAllDevices();
 
         if (devices.isEmpty()) {
             JOptionPane.showMessageDialog(
                     this,
-                    "No devices found in the database."
+                    "No devices found in MySQL, "
+                    + "or the database could not be accessed."
             );
             return;
         }
@@ -195,6 +250,7 @@ public class Main extends JFrame {
         log("Viewed devices from MySQL.");
     }
 
+    // Add a new Light or Fan
     private void addDevice() {
         String[] options = {"Light", "Fan"};
 
@@ -245,13 +301,12 @@ public class Main extends JFrame {
             device = new Fan(name);
         }
 
-        boolean saved = dao.addDevice(device);
-
-        if (!saved) {
+        if (!dao.addDevice(device)) {
             showError(
-                    "The device could not be saved. "
-                    + "It may already exist in MySQL."
+                    "The device could not be saved to MySQL.\n"
+                    + "It may already exist or a database error occurred."
             );
+
             log("Failed to add " + name + " to MySQL.");
             return;
         }
@@ -271,6 +326,7 @@ public class Main extends JFrame {
         updateStatus();
     }
 
+    // Search for a device
     private void searchDevice() {
         String name = JOptionPane.showInputDialog(
                 this,
@@ -282,9 +338,18 @@ public class Main extends JFrame {
         }
 
         Device device;
+        String details = null;
 
         synchronized (manager) {
             device = manager.findDevice(name.trim());
+
+            if (device != null) {
+                details = "Device: " + device.getDeviceName()
+                        + "\nType: "
+                        + device.getClass().getSimpleName()
+                        + "\nStatus: "
+                        + (device.isOn() ? "ON" : "OFF");
+            }
         }
 
         if (device == null) {
@@ -293,16 +358,11 @@ public class Main extends JFrame {
             return;
         }
 
-        JOptionPane.showMessageDialog(
-                this,
-                "Device: " + device.getDeviceName()
-                + "\nType: " + device.getClass().getSimpleName()
-                + "\nStatus: " + (device.isOn() ? "ON" : "OFF")
-        );
-
+        JOptionPane.showMessageDialog(this, details);
         log("Searched for " + device.getDeviceName() + ".");
     }
 
+    // Remove a custom device from MySQL and memory
     private void removeDevice() {
         String name = JOptionPane.showInputDialog(
                 this,
@@ -323,24 +383,19 @@ public class Main extends JFrame {
             return;
         }
 
-        Device device;
-
         synchronized (manager) {
-            device = manager.findDevice(name);
+            if (manager.findDevice(name) == null) {
+                showError("Device not found: " + name);
+                log("Removal failed: " + name);
+                return;
+            }
         }
 
-        if (device == null) {
-            showError("Device not found: " + name);
-            log("Removal failed: " + name);
-            return;
-        }
-
-        boolean deleted = dao.deleteDevice(name);
-
-        if (!deleted) {
+        if (!dao.deleteDevice(name)) {
             showError(
                     "The device could not be deleted from MySQL."
             );
+
             log("Could not remove " + name + " from MySQL.");
             return;
         }
@@ -365,6 +420,7 @@ public class Main extends JFrame {
         updateStatus();
     }
 
+    // Display an error message
     private void showError(String message) {
         JOptionPane.showMessageDialog(
                 this,
@@ -374,6 +430,7 @@ public class Main extends JFrame {
         );
     }
 
+    // Add a timestamped message to the activity log
     private void log(String message) {
         if (activityLog == null) {
             return;
